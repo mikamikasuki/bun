@@ -729,9 +729,12 @@ bool isStringOrBuffer(JSValue value)
     return false;
 }
 
-String makeOptionString(WTF::StringView objName, const ASCIILiteral& optionName)
+// option(name, prefix) in node's lib/internal/crypto/keys.js. A null prefix means that the encoding
+// object is the `options` argument itself (KeyObject#export). Otherwise the prefix is the full path of
+// the encoding object: "key", "options.privateKey", "options.publicKeyEncoding".
+String makeOptionString(WTF::StringView prefix, const ASCIILiteral& optionName)
 {
-    return objName.isNull() ? makeString("options."_s, optionName) : makeString("options."_s, objName, '.', optionName);
+    return prefix.isNull() ? makeString("options."_s, optionName) : makeString(prefix, '.', optionName);
 }
 
 ncrypto::EVPKeyPointer::PKFormatType parseKeyFormat(JSGlobalObject* globalObject, ThrowScope& scope, JSValue formatValue, std::optional<EVPKeyPointer::PKFormatType> defaultFormat, WTF::String optionName)

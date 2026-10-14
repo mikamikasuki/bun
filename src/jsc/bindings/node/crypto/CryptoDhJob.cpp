@@ -29,6 +29,7 @@ void DhJobCtx::runTask(JSGlobalObject* globalObject)
 
     auto dp = DHPointer::stateless(m_privateKey->asymmetricKey, m_publicKey->asymmetricKey);
     if (!dp) {
+        m_opensslError = ERR_get_error();
         return;
     }
 
@@ -38,6 +39,15 @@ void DhJobCtx::runTask(JSGlobalObject* globalObject)
     }
 
     m_result = ByteSource::allocated(dp.release());
+}
+
+// Same error from the synchronous path and the callback path: the OpenSSL error of the failed derive.
+JSValue DhJobCtx::deriveError(JSGlobalObject* globalObject, ThrowScope& scope)
+{
+    if (m_opensslError) {
+        return createCryptoError(globalObject, scope, m_opensslError, nullptr);
+    }
+    return createError(globalObject, ErrorCode::ERR_CRYPTO_OPERATION_FAILED, "diffieHellman operation failed"_s);
 }
 
 extern "C" void Bun__DhJobCtx__runFromJS(DhJobCtx* ctx, JSGlobalObject* globalObject, JSCallbackArgs* out)
@@ -50,8 +60,7 @@ JSCallbackArgs DhJobCtx::runFromJS(JSGlobalObject* lexicalGlobalObject)
     ThrowScope scope = DECLARE_THROW_SCOPE(vm);
 
     if (!m_result) {
-        // Same message as the synchronous path so callers observe identical errors either way.
-        JSObject* err = createError(lexicalGlobalObject, ErrorCode::ERR_CRYPTO_OPERATION_FAILED, "diffieHellman operation failed"_s);
+        JSValue err = deriveError(lexicalGlobalObject, scope);
         RETURN_IF_EXCEPTION(scope, {});
         return { err };
     }
@@ -77,43 +86,59 @@ std::optional<DhJobCtx> DhJobCtx::fromJS(JSGlobalObject* globalObject, ThrowScop
     JSValue publicKeyValue = options->get(globalObject, Identifier::fromString(vm, "publicKey"_s));
     RETURN_IF_EXCEPTION(scope, std::nullopt);
 
-    JSKeyObject* privateKeyObject = dynamicDowncast<JSKeyObject>(privateKeyValue);
-    if (!privateKeyObject) {
+    if (privateKeyValue.isUndefinedOrNull()) {
         ERR::INVALID_ARG_VALUE(scope, globalObject, "options.privateKey"_s, privateKeyValue);
         return std::nullopt;
     }
 
-    JSKeyObject* publicKeyObject = dynamicDowncast<JSKeyObject>(publicKeyValue);
-    if (!publicKeyObject) {
+    if (publicKeyValue.isUndefinedOrNull()) {
         ERR::INVALID_ARG_VALUE(scope, globalObject, "options.publicKey"_s, publicKeyValue);
         return std::nullopt;
     }
 
-    const KeyObject& privateKey = privateKeyObject->handle();
-    const KeyObject& publicKey = publicKeyObject->handle();
-
-    if (privateKey.type() != CryptoKeyType::Private) {
-        ERR::CRYPTO_INVALID_KEY_OBJECT_TYPE(scope, globalObject, privateKey.type(), "private"_s);
+    // Like node, check the KeyObjects before any key data is read.
+    JSKeyObject* privateKeyObject = dynamicDowncast<JSKeyObject>(privateKeyValue);
+    if (privateKeyObject && privateKeyObject->handle().type() != CryptoKeyType::Private) {
+        ERR::CRYPTO_INVALID_KEY_OBJECT_TYPE(scope, globalObject, privateKeyObject->handle().type(), "private"_s);
         return std::nullopt;
     }
 
-    if (publicKey.type() != CryptoKeyType::Public && publicKey.type() != CryptoKeyType::Private) {
-        ERR::CRYPTO_INVALID_KEY_OBJECT_TYPE(scope, globalObject, publicKey.type(), "private or public"_s);
+    JSKeyObject* publicKeyObject = dynamicDowncast<JSKeyObject>(publicKeyValue);
+    if (publicKeyObject && publicKeyObject->handle().type() == CryptoKeyType::Secret) {
+        ERR::CRYPTO_INVALID_KEY_OBJECT_TYPE(scope, globalObject, CryptoKeyType::Secret, "private or public"_s);
         return std::nullopt;
     }
 
-    static constexpr auto supportedKeyTypes = std::to_array<int>({ EVP_PKEY_DH,
-        EVP_PKEY_EC,
-        EVP_PKEY_X448,
-        EVP_PKEY_X25519 });
+    if (privateKeyObject && publicKeyObject) {
+        static constexpr auto supportedKeyTypes = std::to_array<int>({ EVP_PKEY_DH,
+            EVP_PKEY_EC,
+            EVP_PKEY_X448,
+            EVP_PKEY_X25519 });
 
-    int privateKeyType = privateKey.asymmetricKey().id();
-    int publicKeyType = publicKey.asymmetricKey().id();
+        KeyObject& privateKey = privateKeyObject->handle();
+        KeyObject& publicKey = publicKeyObject->handle();
 
-    if (privateKeyType != publicKeyType || std::ranges::find(supportedKeyTypes, privateKeyType) == supportedKeyTypes.end()) {
-        ERR::INVALID_ARG_VALUE(scope, globalObject, "options.privateKey"_s, privateKeyValue, "must be a supported key type"_s);
-        return std::nullopt;
+        int privateKeyType = privateKey.asymmetricKey().id();
+        int publicKeyType = publicKey.asymmetricKey().id();
+
+        if (privateKeyType != publicKeyType || std::ranges::find(supportedKeyTypes, privateKeyType) == supportedKeyTypes.end()) {
+            auto privateKeyTypeName = privateKey.asymmetricKeyType(globalObject).toWTFString(globalObject);
+            RETURN_IF_EXCEPTION(scope, std::nullopt);
+            auto publicKeyTypeName = publicKey.asymmetricKeyType(globalObject).toWTFString(globalObject);
+            RETURN_IF_EXCEPTION(scope, std::nullopt);
+            throwError(globalObject, scope, ErrorCode::ERR_CRYPTO_INCOMPATIBLE_KEY, makeString("Incompatible key types for Diffie-Hellman: "_s, privateKeyTypeName, " and "_s, publicKeyTypeName));
+            return std::nullopt;
+        }
+
+        return DhJobCtx(privateKey.data(), publicKey.data());
     }
+
+    // Key data of a type that cannot derive, or of two types that differ, fails in the derive.
+    KeyObject publicKey = KeyObject::getPublicOrPrivateKeyFromJS(globalObject, scope, publicKeyValue, "options.publicKey"_s);
+    RETURN_IF_EXCEPTION(scope, std::nullopt);
+
+    KeyObject privateKey = KeyObject::getPrivateKeyFromJS(globalObject, scope, privateKeyValue, "options.privateKey"_s);
+    RETURN_IF_EXCEPTION(scope, std::nullopt);
 
     return DhJobCtx(privateKey.data(), publicKey.data());
 }
@@ -146,7 +171,10 @@ JSC_DEFINE_HOST_FUNCTION(jsDiffieHellman, (JSGlobalObject * lexicalGlobalObject,
     ctx->runTask(lexicalGlobalObject);
 
     if (!ctx->m_result) {
-        return ERR::CRYPTO_OPERATION_FAILED(scope, lexicalGlobalObject, "diffieHellman operation failed"_s);
+        JSValue err = ctx->deriveError(lexicalGlobalObject, scope);
+        RETURN_IF_EXCEPTION(scope, {});
+        throwException(lexicalGlobalObject, scope, err);
+        return {};
     }
 
     RELEASE_AND_RETURN(scope, JSValue::encode(WebCore::createBuffer(lexicalGlobalObject, ctx->m_result.span())));
