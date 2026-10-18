@@ -33,6 +33,7 @@ type FSStream = Omit<import("node:fs").ReadStream & import("node:fs").WriteStrea
    * sink = FileSink
    */
   [kWriteStreamFastPath]?: undefined | true | FileSink;
+  [kWriteStreamFlushOnWrite]?: boolean;
 };
 type FD = number;
 
@@ -43,6 +44,7 @@ const kIoDone = Symbol("kIoDone");
 // Bun supports a fast path for `createWriteStream("path.txt")` where instead of
 // using `node:fs`, `Bun.file(...).writer()` is used instead.
 const kWriteStreamFastPath = Symbol("kWriteStreamFastPath");
+const kWriteStreamFlushOnWrite = Symbol("kWriteStreamFlushOnWrite");
 const kFs = Symbol("kFs");
 
 const {
@@ -700,6 +702,31 @@ function writeFast(this: FSStream, data: any, encoding: any, cb: any) {
       );
       return false; // Indicate backpressure
     } else {
+      if (this[kWriteStreamFlushOnWrite]) {
+        let maybeFlushPromise;
+        try {
+          maybeFlushPromise = fileSink.flush();
+        } catch (err) {
+          cb(err);
+          require("internal/streams/destroy").errorOrDestroy(this, err, true);
+          return false;
+        }
+
+        if ($isPromise(maybeFlushPromise)) {
+          maybeFlushPromise.then(
+            () => {
+              emitDrain(this);
+              cb(null);
+            },
+            err => {
+              cb(err);
+              require("internal/streams/destroy").errorOrDestroy(this, err);
+            },
+          );
+          return false;
+        }
+      }
+
       cb(null);
       return true; // No backpressure
     }
@@ -834,6 +861,7 @@ function writableFromFileSink(fileSink: any) {
   const w = new WriteStream("", { $fastPath: true });
   $assert(w[kWriteStreamFastPath] === true, "fast path not enabled");
   w[kWriteStreamFastPath] = fileSink;
+  w[kWriteStreamFlushOnWrite] = true;
   w.path = undefined;
   return w;
 }

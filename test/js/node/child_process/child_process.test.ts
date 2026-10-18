@@ -722,6 +722,46 @@ describe("spawn()", () => {
     });
   });
 
+  it.skipIf(isWindows)("stdin write failure (EPIPE) is reported for a small write buffered by FileSink", async () => {
+    // The child closes its own stdin, signals readiness, then stays alive so
+    // the parent's small write fails during FileSink's deferred flush.
+    const child = spawn(
+      bunExe(),
+      ["-e", `require("fs").closeSync(0); process.stdout.write("ready\\n"); setInterval(() => {}, 1e5);`],
+      { env: bunEnv, stdio: ["pipe", "pipe", "ignore"] },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.on("error", reject);
+        child.on("exit", () => reject(new Error("child exited before ready")));
+        child.stdout!.once("data", () => resolve());
+      });
+      child.removeAllListeners("error");
+      child.removeAllListeners("exit");
+
+      const errors: { callback?: NodeJS.ErrnoException; event?: NodeJS.ErrnoException } = {};
+      child.stdin!.on("error", error => (errors.event = error));
+      child.stdin!.write("hello\\n", error => (errors.callback = error));
+
+      // Let the end-of-turn FileSink flush run before inspecting the stream.
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      expect({
+        callback: errors.callback?.code,
+        event: errors.event?.code,
+        syscall: errors.event?.syscall,
+        destroyed: child.stdin!.destroyed,
+      }).toEqual({
+        callback: "EPIPE",
+        event: "EPIPE",
+        syscall: "write",
+        destroyed: true,
+      });
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
   it.skipIf(isWindows)(
     "stdin write failure (EPIPE) emits 'error' and destroys even with a write callback",
     async () => {
