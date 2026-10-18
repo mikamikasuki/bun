@@ -38,6 +38,49 @@ test("support eval in worker", async () => {
   await worker.terminate();
 });
 
+test("preserves shared WebAssembly.Memory address type in workerData", async () => {
+  const workerSource = [
+    'const { parentPort, workerData } = require("node:worker_threads");',
+    "const memoryKind = memory => {",
+    "try {",
+    "  memory.grow(0n);",
+    '  return "i64";',
+    "} catch {",
+    '  return "i32";',
+    "}",
+    "};",
+    'parentPort.postMessage("worker: " + memoryKind(workerData.memory32) + " " + memoryKind(workerData.memory64));',
+  ].join("\n");
+  const fixture = `
+    const { Worker } = require("node:worker_threads");
+    const memory32 = new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });
+    const memory64 = new WebAssembly.Memory({ initial: 1n, maximum: 2n, shared: true, address: "i64" });
+    const memoryKind = memory => {
+      try {
+        memory.grow(0n);
+        return "i64";
+      } catch {
+        return "i32";
+      }
+    };
+    console.log("main:", memoryKind(memory32), memoryKind(memory64));
+    const worker = new Worker(${JSON.stringify(workerSource)}, { eval: true, workerData: { memory32, memory64 } });
+    worker.on("message", message => console.log(message));
+  `;
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "-e", fixture],
+    env: { ...bunEnv, BUN_JSC_useWasmMemory64: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({
+    stdout: "main: i32 i64\nworker: i32 i64",
+    stderr: "",
+    exitCode: 0,
+  });
+});
+
 test("all worker_threads module properties are present", () => {
   expect(wt).toHaveProperty("getEnvironmentData");
   expect(wt).toHaveProperty("isMainThread");

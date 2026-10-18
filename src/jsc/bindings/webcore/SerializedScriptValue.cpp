@@ -416,8 +416,9 @@ const uint8_t cryptoKeyOKPOpNameTagMaximumValue = 1;
  * Version 13. added support for ErrorInstance objects.
  * Version 14. Date, RegExp, Error, DOMException, CryptoKey, KeyObject, X509Certificate,
  * and Bun cloneable types are recorded in the object reference pool on both sides.
+ * Version 15. records the address type when serializing a shared WebAssembly.Memory.
  */
-[[maybe_unused]] static constexpr unsigned CurrentVersion = 14;
+[[maybe_unused]] static constexpr unsigned CurrentVersion = 15;
 // Deserializers must not pool the version 14 terminal types for older payloads,
 // whose writers never counted them, or the pool indices stop matching the writer's.
 [[maybe_unused]] static constexpr unsigned FirstVersionWithPooledTerminals = 14;
@@ -486,7 +487,7 @@ static constexpr unsigned StringDataIs8BitFlag = 0x80000000;
  *    | RTCCertificateTag
  *    | ImageBitmapTag <originClean:uint8_t> <logicalWidth:int32_t> <logicalHeight:int32_t> <resolutionScale:double> DestinationColorSpace <byteLength:uint32_t>(<imageByteData:uint8_t>)
  *    | OffscreenCanvasTransferTag <value:uint32_t>
- *    | WasmMemoryTag <value:uint32_t>
+ *    | WasmMemoryTag <value:uint32_t> [<isMemory64:int32_t>]
  *    | RTCDataChannelTransferTag <identifier:uint32_t>
  *    | DOMExceptionTag <message:String> <name:String>
  *    | WebCodecsEncodedVideoChunkTag <identifier:uint32_t>
@@ -1393,6 +1394,7 @@ private:
                 write(WasmMemoryTag);
                 write(agentClusterIDFromGlobalObject(*m_lexicalGlobalObject));
                 write(index);
+                write(memory->memory().addressType() == Wasm::AddressType::I64);
                 return true;
             }
 #endif
@@ -3791,6 +3793,12 @@ private:
                 return JSValue();
             }
 
+            bool isMemory64 = false;
+            if (m_version >= 15 && !read(isMemory64)) {
+                fail();
+                return JSValue();
+            }
+
             auto& vm = m_lexicalGlobalObject->vm();
             auto scope = DECLARE_THROW_SCOPE(vm);
             JSWebAssemblyMemory* result = JSC::JSWebAssemblyMemory::create(vm, m_globalObject->webAssemblyMemoryStructure());
@@ -3801,11 +3809,7 @@ private:
 
             RefPtr<Wasm::Memory> memory;
             auto handler = [&vm, result](Wasm::Memory::GrowSuccess, PageCount oldPageCount, PageCount newPageCount) { result->growSuccessCallback(vm, oldPageCount, newPageCount); };
-            // Memory64 is not yet serialized in WasmMemoryTag, so we only
-            // support I32 address type for structured clone. Upstream WebKit
-            // has the same limitation (it calls result->memory().addressType()
-            // on an uninitialized stub here, which happens to return I32).
-            constexpr auto addressType = Wasm::AddressType::I32;
+            const auto addressType = isMemory64 ? Wasm::AddressType::I64 : Wasm::AddressType::I32;
             if (RefPtr<SharedArrayBufferContents> contents = m_wasmMemoryHandles->at(index)) {
                 if (!contents->memoryHandle()) {
                     fail();
